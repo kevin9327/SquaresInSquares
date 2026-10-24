@@ -140,6 +140,50 @@ def build_gobel_staircase(k: int, s: int, L_trial: float) -> np.ndarray:
     return np.array(rows, dtype=np.float64)
 
 
+def build_main_diagonal_split(k: int, s_left: int, s_right: int, L_trial: float) -> np.ndarray:
+    """
+    Friedman / Chung-Graham Main-Diagonal Split inside [0, L_trial]^2:
+    1) Upper-left axis-aligned triangle anchored at top-left corner (x=0, y=L_trial)
+    2) Lower-right axis-aligned triangle anchored at bottom-right corner (x=L_trial, y=0)
+    3) Uniform 45-degree tilted channel along the full main diagonal x = y separating the two triangles.
+    Strictly separated along normal n = (1/sqrt(2), -1/sqrt(2)) whenever u_high >= u_low.
+    """
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    step = 1.0 + 2e-5
+    u_low = ((k + 1 - s_left) - L_trial) * inv_sqrt2 + 0.5 + 3e-5
+    u_high = (L_trial - (k + 1 - s_right)) * inv_sqrt2 - 0.5 - 3e-5
+    if u_high < u_low:
+        return np.empty((0, 3), dtype=np.float64)
+
+    rows = []
+    for i in range(k):
+        for r in range(k):
+            if i + r <= k - 1 - s_left and (i + 1.0) <= L_trial and (r + 1.0) <= L_trial:
+                rows.append((i + 0.5, L_trial - r - 0.5, 0.0))
+
+    for c in range(k):
+        for j in range(k):
+            if c + j <= k - 1 - s_right and (c + 1.0) <= L_trial and (j + 1.0) <= L_trial:
+                rows.append((L_trial - c - 0.5, j + 0.5, 0.0))
+
+    n_layers = int(math.floor((u_high - u_low) / step)) + 1
+    u_start = 0.5 * (u_low + u_high) - 0.5 * (n_layers - 1) * step
+    for l in range(n_layers):
+        u_l = u_start + l * step
+        v_min = 1.0 + abs(u_l) + 3e-5
+        v_max = math.sqrt(2.0) * L_trial - 1.0 - abs(u_l) - 3e-5
+        if v_max >= v_min:
+            m_cnt = int(math.floor((v_max - v_min) / step)) + 1
+            v_0 = 0.5 * (v_min + v_max) - 0.5 * (m_cnt - 1) * step
+            for m in range(m_cnt):
+                v_m = v_0 + m * step
+                cx = (v_m + u_l) * inv_sqrt2
+                cy = (v_m - u_l) * inv_sqrt2
+                rows.append((cx, cy, math.pi / 4.0))
+
+    return np.array(rows, dtype=np.float64)
+
+
 def main() -> None:
     t0 = time.perf_counter()
     best_L: Dict[int, float] = {}
@@ -217,18 +261,38 @@ def main() -> None:
                                     best_L[n_sub] = L_meas
                                     best_sq[n_sub] = sub_pts
 
+    # 3. Apply Friedman Main-Diagonal Split across k = 3..31 with SAT verification
+    for k in range(3, 32):
+        for s_l in range(0, min(k, 10)):
+            for s_r in range(s_l, min(k, s_l + 3)):
+                for frac in frac_grid:
+                    L_t = k + frac
+                    sq_cand = build_main_diagonal_split(k, s_l, s_r, L_t)
+                    n_packed = len(sq_cand)
+                    if k * k < n_packed <= 1000:
+                        upper_n = min(n_packed, (k + 1) * (k + 1) - 1, 1000)
+                        needs_verify = any(L_t + 1e-3 < best_L[n_sub] for n_sub in range(k * k + 1, upper_n + 1))
+                        if needs_verify:
+                            ok, L_meas, sq_clean = measure_and_verify_sat(sq_cand)
+                            if ok:
+                                for n_sub in range(k * k + 1, upper_n + 1):
+                                    if L_meas < best_L[n_sub]:
+                                        sub_pts = sq_clean[:n_sub].copy()
+                                        best_L[n_sub] = L_meas
+                                        best_sq[n_sub] = sub_pts
+
     base_score = sum(math.ceil(math.sqrt(n)) / math.sqrt(n) - 1.0 for n in range(1, 1001))
     opt_score = sum(best_L[n] / math.sqrt(n) - 1.0 for n in range(1, 1001))
     improved_puzzles = [n for n in range(1, 1001) if best_L[n] < math.ceil(math.sqrt(n)) - 1e-4]
 
     print(
-        f"[Squares in Squares] Solved n=1..1000 in {time.perf_counter()-t0:.2f}s | "
+        f"[Squares in Squares v2] Solved n=1..1000 in {time.perf_counter()-t0:.2f}s | "
         f"Improved puzzles: {len(improved_puzzles)} | "
         f"Baseline Score: {base_score:.6f} -> Optimized Score: {opt_score:.6f} "
         f"(gain: {base_score - opt_score:.6f})"
     )
 
-    # Assemble 500,500-row submission.csv (id,n,square_id,x,y,angle)
+    # Assemble 500,500-row submission.csv & submission_v2.csv (id,n,square_id,x,y,angle)
     total_rows = 1000 * 1001 // 2
     ids = np.arange(total_rows, dtype=np.int64)
     n_col = np.empty(total_rows, dtype=np.int32)
@@ -258,8 +322,10 @@ def main() -> None:
         }
     )
     out_csv = OUT_DIR / "submission.csv"
+    out_v2 = OUT_DIR / "submission_v2.csv"
     df_sub.to_csv(out_csv, index=False)
-    print(f"[Saved] {out_csv} ({len(df_sub):,} rows, {out_csv.stat().st_size:,} bytes)")
+    df_sub.to_csv(out_v2, index=False)
+    print(f"[Saved] {out_csv} & {out_v2} ({len(df_sub):,} rows, {out_v2.stat().st_size:,} bytes)")
 
 
 if __name__ == "__main__":
